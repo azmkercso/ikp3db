@@ -23,14 +23,13 @@ import argparse
 import datetime
 import io
 import ctypes
-import cgi
 
 import iksettrace3
 
 
 # For now ikpdb is a singleton
 ikpdb = None 
-__version__ = "1.4.2"
+__version__ = "1.4.2.post1"
 
 ##
 # Logging System
@@ -637,9 +636,6 @@ class IKPdb(object):
         # If True, debugger breaks on first line to allow user to setup 
         # some breakpoints.
         self.stop_at_first_statement = True if stop_at_first_statement else False
-        
-        # Some parameters that may need to become cli options
-        self.CGI_ESCAPE_EVALUATE_OUTPUT = False
 
 
     def canonic(self, file_name):
@@ -924,8 +920,6 @@ class IKPdb(object):
         'frame_id' or globally.
         Breakpoints are disabled depending on 'disable_break' value.
         Returns a tuple of value and type both as str.
-        Note that - depending on the CGI_ESCAPE_EVALUATE_OUTPUT attribute - value is 
-        escaped.
         """
         if disable_break:
             breakpoints_backup = IKBreakpoint.backup_breakpoints_state()
@@ -972,8 +966,6 @@ class IKPdb(object):
                         result_value, 
                         result_type, 
                         result)
-        if self.CGI_ESCAPE_EVALUATE_OUTPUT:
-            result_value = cgi.escape(result_value)
         
         # We must check that result is json.dump compatible so that it can be sent back to client.
         try:

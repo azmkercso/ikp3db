@@ -21,6 +21,45 @@ static long debuggerThreadIdent = 0;  // Track debugger thread ident
  */
 static PyObject *whatstrings[7] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL};
 
+#if PY_VERSION_HEX >= 0x030B00A1 && PY_VERSION_HEX < 0x030F00A1
+// 'struct _frame' for 'typedef _frame PyFrameObject' is not exposed via Python C API since Python 3.11,
+// however its members can still be accessed/written directly via Python stdlib calls
+// Ikp3d passes the tracer function via an existing but now hidden 'f_trace' member
+// The structure is the same for Copying structure here so it can be properly referenced here
+// Python 3.11 sources:
+// - PyFrameObject typedef: https://github.com/python/cpython/blob/v3.11.12/Include/pytypedefs.h#L22
+//.- struct definition: https://github.com/python/cpython/blob/v3.11.12/Include/internal/pycore_frame.h#L15-L26
+// - stdlib property getters/setters: https://github.com/python/cpython/blob/v3.11.12/Objects/frameobject.c#L834-L845
+// Python 3.12 sources:
+// - PyFrameObject typedef: https://github.com/python/cpython/blob/v3.12.10/Include/pytypedefs.h#L22
+// - struct definition: https://github.com/python/cpython/blob/v3.12.10/Include/internal/pycore_frame.h#L16-L27
+// - stdlib property getters/setters: https://github.com/python/cpython/blob/v3.12.10/Objects/frameobject.c#L869-L881
+struct _frame {
+    PyObject_HEAD
+    PyFrameObject *f_back;
+    // 'f_frame' is not used for ikp3db purposes
+    // This is originally a struct pointer for '_PyInterpreterFrame' (https://github.com/python/cpython/blob/v3.11.12/Include/internal/pycore_frame.h#L18)
+    // Leaving a placeholder 'void' pointer here to keep the correct struct offsets for the other members
+    void *f_frame;
+    PyObject *f_trace;
+    int f_lineno;
+    char f_trace_lines;
+    char f_trace_opcodes;
+# if PY_VERSION_HEX >= 0x030D00A1
+    // Python 3.13 struct definition: https://github.com/python/cpython/blob/v3.13.3/Include/internal/pycore_frame.h#L20-L35
+    PyObject *f_extra_locals;
+    PyObject *f_locals_cache;
+#  if PY_VERSION_HEX >= 0x030E00A1
+    // Python 3.14 struct definition: https://github.com/python/cpython/blob/3.14/Include/internal/pycore_frame.h#L18-L39
+    PyObject *f_overwritten_fast_locals;
+#  endif
+# else
+    char f_fast_as_locals;
+# endif
+    PyObject *_f_frame_data[1];
+};
+#endif
+
 static int trace_init(void)
 {
     static const char * const whatnames[7] = {
@@ -46,10 +85,20 @@ call_trampoline(PyObject* callback,
 {
     PyObject *result;
     PyObject *stack[3];
+    PyObject *locals;
 
+#if PY_VERSION_HEX >= 0x030B00A1
+    // This call is needed to initialise frame local fields
+    // The return value is a strong reference, but not used by us
+    locals = PyFrame_GetLocals(frame);
+    if (locals == NULL) {
+        return NULL;
+    }
+#else
     if (PyFrame_FastToLocalsWithError(frame) < 0) {
         return NULL;
     }
+#endif
 
     stack[0] = (PyObject *)frame;
     stack[1] = whatstrings[what];
@@ -57,7 +106,12 @@ call_trampoline(PyObject* callback,
     /* call the Python-level function */
     result = _PyObject_FastCall(callback, stack, 3);
 
+#if PY_VERSION_HEX >= 0x030B00A1
+    // Release the strong reference created by PyFrame_GetLocals
+    Py_CLEAR(locals);
+#else
     PyFrame_LocalsToFast(frame, 1);
+#endif
     if (result == NULL) {
         PyTraceBack_Here(frame);
     }
@@ -76,8 +130,10 @@ trace_trampoline(PyObject *self, PyFrameObject *frame,
         callback = self;
     else
         callback = frame->f_trace;
+
     if (callback == NULL)
         return 0;
+
     result = call_trampoline(callback, frame, what, arg);
     if (result == NULL) {
         PyEval_SetTrace(NULL, NULL);
@@ -90,9 +146,9 @@ trace_trampoline(PyObject *self, PyFrameObject *frame,
     else {
         Py_DECREF(result);
     }
+
     return 0;
 }
-
 
 /* 
  * iksettrace3 'real' functions
@@ -104,10 +160,17 @@ trace_trampoline(PyObject *self, PyFrameObject *frame,
 static inline void
 IK_UseTracing(PyThreadState *tstate, int use_tracing)
 {
+#if PY_VERSION_HEX >= 0x030B00A1
+    if (use_tracing) {
+        PyThreadState_EnterTracing(tstate);
+    } else {
+        PyThreadState_LeaveTracing(tstate);
+    }
+#elif PY_VERSION_HEX >= 0x030A00A1
     tstate->tracing += use_tracing ? 1 : -1;
-#if PY_VERSION_HEX >= 0x030A00A1
     tstate->cframe->use_tracing = use_tracing ? 255 : 0;
 #else
+    tstate->tracing += use_tracing ? 1 : -1;
     tstate->use_tracing = use_tracing;
 #endif
 }
@@ -122,7 +185,7 @@ IK_SetTrace(Py_tracefunc func, PyObject *arg)
     PyInterpreterState *interp = PyInterpreterState_Head();
     PyThreadState *loopThreadState = PyInterpreterState_ThreadHead(interp);
     while(loopThreadState) {
-        if(loopThreadState->thread_id!=debuggerThreadIdent) {
+        if ((unsigned long)loopThreadState->thread_id != (unsigned long)debuggerThreadIdent) {
             PyObject *temp = loopThreadState->c_traceobj;
             Py_XINCREF(arg);
             loopThreadState->c_tracefunc = NULL;
